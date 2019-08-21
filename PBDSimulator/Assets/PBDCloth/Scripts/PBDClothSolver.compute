@@ -25,6 +25,16 @@ struct CollidableSphereStruct {
 struct CollidableCubeStruct {
 	float3 center;
 	float3 extent;
+	float3 xVec;
+	float3 yVec;
+	float3 zVec;
+};
+
+struct CollidableCapsuleStruct{
+	float3 center;
+	float3 up;
+	float height;
+	float radius;
 };
 
 // Uniform data
@@ -34,6 +44,7 @@ uint numBendingConstraints;
 uint numAllConstraints;
 uint numCollidableSpheres;
 uint numCollidableCubes;
+uint numCollidableCapsules;
 uint numPointConstraints;
 float3 gravity;
 float invMass;
@@ -54,6 +65,7 @@ StructuredBuffer<DistanceConstraintStruct> distanceConstraints;
 StructuredBuffer<BendingConstraintStruct> bendingConstraints;
 StructuredBuffer<CollidableSphereStruct> collidableSpheres;
 StructuredBuffer<CollidableCubeStruct> collidableCubes;
+StructuredBuffer<CollidableCapsuleStruct> collidableCapsule;
 StructuredBuffer<int> pointConstraints;
 
 bool hasTempPointConstraint;
@@ -312,6 +324,38 @@ bool IsPointInCube(float3 position, float3 extent) {
 	return abs(position.x) < extent.x && abs(position.y) < extent.y && abs(position.z) < extent.z;
 }
 
+struct CubeCollisionInfo{
+	bool ifCubeCollision;
+	float3 moveOut;
+};
+
+CubeCollisionInfo IsPointInCube2(float3 position, float3 xx, float3 yy,float3 zz) {
+	CubeCollisionInfo res;
+	float3 nPosition=normalize(position);
+	float minDistance=length(xx)+length(yy)+length(zz);
+	float3 moveout=xx;
+	float xPos=length(position)*dot(normalize(xx),nPosition);
+	if(sign(xPos)* (sign(xPos)*length(xx)-xPos) <minDistance){
+		minDistance=sign(xPos)* (sign(xPos)*length(xx)-xPos);
+		moveout=sign(xPos)*normalize(xx);
+	}
+	float yPos=length(position)*dot(normalize(yy),nPosition);
+	if(sign(yPos)* (sign(yPos)*length(yy)-yPos) <minDistance){
+		minDistance=sign(yPos)* (sign(yPos)*length(yy)-yPos);
+		moveout=sign(yPos)*normalize(yy);
+	}
+
+	float zPos=length(position)*dot(normalize(zz),nPosition);
+	if(sign(zPos)* (sign(zPos)*length(zz)-zPos) <minDistance){
+		minDistance=sign(zPos)* (sign(zPos)*length(zz)-zPos);
+		moveout=sign(zPos)*normalize(zz);
+	}
+
+	res.ifCubeCollision=abs(xPos)<length(xx) && abs(yPos)<length(yy) && abs(zPos)<length(zz);
+	res.moveOut=moveout*(minDistance+0.001f);
+	return res;
+}
+
 [numthreads(8, 1, 1)] // TODO: play around with numthread size
 void SatisfyCubeCollisions(uint3 id : SV_DispatchThreadID) {
 	if (id.x >= numParticles) return;
@@ -321,38 +365,60 @@ void SatisfyCubeCollisions(uint3 id : SV_DispatchThreadID) {
 	for (uint i = 0; i < numCollidableCubes; i++) {	
 		float3 center = collidableCubes[i].center;
 		float3 extent = collidableCubes[i].extent;
+		float3 xx=collidableCubes[i].xVec;
+		float3 yy=collidableCubes[i].yVec;
+		float3 zz=collidableCubes[i].zVec;
 		float3 localPosition = projectedPosition - center;
 
-		if (IsPointInCube(localPosition, extent)) {
-			int closestAxis = -1;
-			float closestDist = 99999;
-			for (int i = 0; i < 3; i++) {
-				float dist = abs(localPosition[i] - extent[i]);
-				if (dist < closestDist) {
-					closestDist = dist;
-					closestAxis = i;
-				}
-			}
+		CubeCollisionInfo cubeCollisionInfo=IsPointInCube2(localPosition,xx,yy,zz);
 
-			float3 newPos = localPosition;
-			if (closestAxis == 0) {
-				newPos.x = (extent.x + 0.001f) * sign(localPosition.x);
-			}
-			else if (closestAxis == 1) {
-				newPos.y = (extent.y + 0.001f) * sign(localPosition.y);
-			}
-			else if (closestAxis == 2) {
-				newPos.z = (extent.z + 0.001f) * sign(localPosition.z);
-			}
 
-			projectedPosition = newPos + center;
+		if(cubeCollisionInfo.ifCubeCollision){
+			projectedPosition = projectedPosition + cubeCollisionInfo.moveOut;
 			frictions[id.x] = 0.8f;
 		}
+
 	}
 
 	projectedPositions[id.x] = projectedPosition;
 }
 
+#pragma kernel SatisfyCapsuleCollisions
+
+[numthreads(8, 1, 1)] // TODO: play around with numthread size
+void SatisfyCapsuleCollisions(uint3 id : SV_DispatchThreadID) {
+	if (id.x >= numParticles) return;
+
+	float3 projectedPosition = projectedPositions[id.x];
+	for (uint i = 0; i < numCollidableCapsules; i++) {
+		float3 center = collidableCapsule[i].center;
+		float radius = collidableCapsule[i].radius;
+		float3 up = collidableCapsule[i].up;
+
+		float3 D=projectedPosition-center;
+		float cosTheta=dot(normalize(D),normalize(up-center));
+		float sinTheta=sqrt(1-pow(cosTheta,2));
+		float heightDistance=length(D)*cosTheta;
+		float height=length(up-center);
+		if((heightDistance>=-height)&&(heightDistance<=height)&&(length(D)*sinTheta<=radius)){
+			float3 temp=cross(D,(up-center));
+			float3 moveOut=normalize(cross((up-center),temp));
+			projectedPosition = center+normalize(up-center)*length(D)*cosTheta + moveOut*(radius+0.01f);
+			frictions[id.x] = 0.8f;
+		}else if((heightDistance>=-height-radius)&&(heightDistance<=height+radius)&&
+			(length(projectedPosition-up)<=radius)){
+			float3 n = normalize(projectedPosition - up);
+			projectedPosition = up + n * (radius + 0.01f);
+			frictions[id.x] = 0.8f;
+		}else if((heightDistance>=-height-radius)&&(heightDistance<=height+radius)&&
+			(length(projectedPosition-2*center+up)<=radius)){
+			float3 n = normalize(projectedPosition - 2*center+up);
+			projectedPosition = 2*center-up + n * (radius + 0.01f);
+			frictions[id.x] = 0.8f;
+		}
+		projectedPositions[id.x] = projectedPosition;
+	}
+}
 
 #pragma kernel SatisfyPointConstraints
 [numthreads(8, 1, 1)] // TODO: play around with numthread size
